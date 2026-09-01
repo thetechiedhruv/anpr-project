@@ -1,0 +1,104 @@
+# .gitignore for Vehicle Detection project
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+eggs/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+ENV/
+venv*/
+
+# Pipenv / poetry
+Pipfile.lock
+poetry.lock
+
+# Pyenv
+.python-version
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter
+.ipynb_checkpoints
+
+# Logs and databases
+*.log
+logs/
+*.sqlite3
+*.db
+
+# Test and cache
+.pytest_cache/
+.cache/
+
+# mypy
+.mypy_cache/
+
+# Coverage reports
+htmlcov/
+.coverage
+coverage.xml
+
+# Environment files
+.env
+.env.*
+
+# Model weights and large artifacts
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# Project-specific large dirs
+test_models/
+outputs/
+runs/
+uploads/
+videos/
+
+# Models and weights
+models/
+weights/
+
+# Trained weights subdirs
+runs/train*/weights/
+
+# Datasets and archives
+dataset/
+data/
+datasets/
+*.zip
+*.tar.gz
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backups and swap
+*~
+*.bak
+*.swp
+
+# Large media
+*.mp4
+*.mov
+*.avi
+*.mkv
+
