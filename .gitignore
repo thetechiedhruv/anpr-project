@@ -21,6 +21,7 @@ venv/
 env/
 ENV/
 venv*/
+nishvenv/
 
 # Pipenv / poetry
 Pipfile.lock
@@ -71,12 +72,12 @@ test_models/
 outputs/
 runs/
 uploads/
-videos/
+# videos/
 
 # Models and weights
 models/
 weights/
-
+videos/
 # Trained weights subdirs
 runs/train*/weights/
 

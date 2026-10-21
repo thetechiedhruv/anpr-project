@@ -10,10 +10,14 @@ import warnings
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["FLAGS_log_level"] = "3"
-os.environ["FLAGS_use_pir_api"] = "0"
-os.environ["FLAGS_enable_pir"] = "0"
-os.environ["FLAGS_use_mkldnn"] = "0"
-os.environ["PADDLE_DISABLE_MKLDNN"] = "1"
+
+# PaddleX picks the oneDNN CPU backend by default, which crashes inside
+# Paddle's PIR executor on PP-OCRv6_medium_det:
+#   NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support
+#                        [pir::ArrayAttribute<pir::DoubleAttribute>]
+# This is the flag PaddleX actually reads (paddlex/utils/flags.py).
+# FLAGS_use_mkldnn / PADDLE_DISABLE_MKLDNN are ignored by PaddleX and do nothing.
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "False"
 
 logging.getLogger("ppocr").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
@@ -36,12 +40,32 @@ from paddleocr import PaddleOCR
 # ===========================
 
 PLATE_MODEL_PATH = "models/license-plate-finetune-v1x.pt"
-VEHICLE_MODEL_PATH = "yolo12m.pt"
 
-INPUT_VIDEO = "videos/clip_1.mp4"
+# Swap to "yolov8s.pt" or "yolo26s.pt" for ~3x faster vehicle detection
+# at some cost in accuracy.
+VEHICLE_MODEL_PATH = os.environ.get("VEHICLE_MODEL_PATH", "yolo12m.pt")
+
+INPUT_VIDEO = "videos/bike_plates.mp4"
 base_name = os.path.splitext(os.path.basename(INPUT_VIDEO))[0]
-OUTPUT_VIDEO = f"output/{base_name}_output.mp4"
+OUTPUT_VIDEO = f"outputs/{base_name}_output.mp4"
 
+
+# ===========================
+# Performance Tuning
+# ===========================
+
+# Vehicles are large objects; 1920 was paying full cost for no benefit.
+VEHICLE_IMGSZ = 192*2
+
+# The plate model runs on a cropped vehicle ROI, so it needs less resolution.
+PLATE_IMGSZ = 640
+
+# Run vehicle detection every Nth frame and reuse boxes in between.
+# A vehicle barely moves in 1/30 s, so this is close to free.
+DETECT_EVERY_N = 8
+
+# Each tracked vehicle is OCR'd at most this many times, then left alone.
+MAX_SCAN_ATTEMPTS = 3
 
 
 # ===========================
@@ -55,10 +79,13 @@ plate_model = YOLO(PLATE_MODEL_PATH)
 vehicle_model = YOLO(VEHICLE_MODEL_PATH)
 
 # OCR Engine
+# Document orientation / unwarping / textline orientation each load and run an
+# extra model per call. Plate crops are small and upright, so they are off.
 ocr = PaddleOCR(
     lang="en",
-    use_textline_orientation=True,
-    show_log=False
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False,
 )
 
 
@@ -109,6 +136,9 @@ def clean_plate_text(text: str) -> str:
 def perform_ocr(plate_img: np.ndarray):
     """
     Perform OCR on cropped license plate image.
+
+    PaddleOCR 3.x returns a list of dict-like OCRResult objects carrying
+    "rec_texts" / "rec_scores", not the 2.x list-of-word-tuples.
     """
 
     raw_text = ""
@@ -119,17 +149,20 @@ def perform_ocr(plate_img: np.ndarray):
     if not results:
         return "", best_conf
 
-    for line in results:
+    for res in results:
 
-        if line is None:
+        if res is None:
             continue
 
-        for word_info in line:
+        texts = res.get("rec_texts") or []
+        scores = res.get("rec_scores") or []
 
-            if word_info is None or len(word_info) < 2:
+        for i, text in enumerate(texts):
+
+            if not text:
                 continue
 
-            text, conf = word_info[1]
+            conf = float(scores[i]) if i < len(scores) else 0.0
 
             raw_text += text
             best_conf = max(best_conf, conf)
@@ -153,7 +186,7 @@ def detect_plates(img: np.ndarray):
 
     results = plate_model(
         img,
-        imgsz=1280,
+        imgsz=PLATE_IMGSZ,
         conf=0.35,
         iou=0.5,
         verbose=False
@@ -209,6 +242,9 @@ def draw_plate_box(img, x1, y1, x2, y2, text):
     # Draw box
     cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
+    if not text:
+        return
+
     # Text size
     (w, h), b = cv2.getTextSize(text, font, scale, thickness)
 
@@ -258,12 +294,20 @@ def draw_vehicle_box(img, x1, y1, x2, y2, label):
 
 def process_video():
 
+    out_dir = os.path.dirname(OUTPUT_VIDEO)
+
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     cap = cv2.VideoCapture(INPUT_VIDEO)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open input video: {INPUT_VIDEO}")
 
     # Video Properties
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
 
     # Output Writer
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -275,7 +319,21 @@ def process_video():
         (width, height)
     )
 
+    if not out.isOpened():
+        raise RuntimeError(f"Cannot open output video for writing: {OUTPUT_VIDEO}")
+
     print("Processing video...")
+
+    # vehicle_id -> confirmed plate text
+    plates_by_id = {}
+
+    # vehicle_id -> number of OCR attempts spent
+    scan_attempts = {}
+
+    # Boxes from the most recent detection frame, reused on skipped frames
+    last_boxes = []
+
+    frame_idx = 0
 
     while True:
 
@@ -284,49 +342,99 @@ def process_video():
         if not ret:
             break
 
-        # Detect vehicles
-        results = vehicle_model(
-            frame,
-            imgsz=1920,
-            conf=0.3,
-            iou=0.5,
-            verbose=False
-        )
+        if frame_idx % DETECT_EVERY_N == 0:
 
-        for box in results[0].boxes:
+            # Track so each vehicle gets a stable ID and is scanned once
+            results = vehicle_model.track(
+                frame,
+                persist=True,
+                imgsz=VEHICLE_IMGSZ,
+                conf=0.3,
+                iou=0.5,
+                verbose=False
+            )
 
-            cls_id = int(box.cls)
+            last_boxes = []
 
-            if cls_id not in VEHICLE_CLASSES:
-                continue
+            boxes = results[0].boxes
 
-            label = vehicle_model.names[cls_id]
+            if boxes is not None:
 
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                for box in boxes:
 
-            vehicle_roi = frame[y1:y2, x1:x2]
+                    cls_id = int(box.cls)
 
-            if vehicle_roi.size == 0:
-                continue
+                    if cls_id not in VEHICLE_CLASSES:
+                        continue
 
-            # Detect plates inside vehicle
-            plates = detect_plates(vehicle_roi)
+                    label = vehicle_model.names[cls_id]
 
-            # Draw vehicle
-            draw_vehicle_box(frame, x1, y1, x2, y2, label)
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            # Print detected plates
-            for plate in plates:
-                print("Detected Plate:", plate["plate"])
+                    vehicle_id = int(box.id.item()) if box.id is not None else None
+
+                    last_boxes.append((x1, y1, x2, y2, label, vehicle_id))
+
+                    # Without an ID we cannot avoid re-scanning every frame
+                    if vehicle_id is None:
+                        continue
+
+                    # Already read, or we gave up on this vehicle
+                    if plates_by_id.get(vehicle_id):
+                        continue
+
+                    if scan_attempts.get(vehicle_id, 0) >= MAX_SCAN_ATTEMPTS:
+                        continue
+
+                    vehicle_roi = frame[y1:y2, x1:x2]
+
+                    if vehicle_roi.size == 0:
+                        continue
+
+                    scan_attempts[vehicle_id] = scan_attempts.get(vehicle_id, 0) + 1
+
+                    # Detect plates inside vehicle
+                    plates = detect_plates(vehicle_roi)
+
+                    # Keep the first valid read for this vehicle
+                    for plate in plates:
+
+                        if plate["plate"]:
+
+                            plates_by_id[vehicle_id] = plate["plate"]
+
+                            print(
+                                f"Detected Plate: {plate['plate']} "
+                                f"(vehicle {vehicle_id}, frame {frame_idx})"
+                            )
+
+                            break
+
+        # Draw vehicles (on detection and skipped frames alike)
+        for x1, y1, x2, y2, label, vehicle_id in last_boxes:
+
+            caption = label
+
+            if vehicle_id is not None:
+                caption = f"{label} ID:{vehicle_id}"
+
+            text = plates_by_id.get(vehicle_id)
+
+            if text:
+                caption = f"{caption} {text}"
+
+            draw_vehicle_box(frame, x1, y1, x2, y2, caption)
 
         out.write(frame)
+
+        frame_idx += 1
 
     cap.release()
     out.release()
 
     print("Processing completed!")
-    op_base_name = os.path.splitext(os.path.basename(OUTPUT_VIDEO))[0]
-    print("Saved to:", op_base_name)
+    print(f"Frames: {frame_idx}, unique plates: {len(set(plates_by_id.values()))}")
+    print("Saved to:", OUTPUT_VIDEO)
 
 
 # ===========================

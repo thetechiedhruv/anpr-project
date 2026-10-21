@@ -110,7 +110,7 @@ def get_models():
             _ocr = PaddleOCR(
                 lang="en",
                 use_textline_orientation=True,
-                show_log=False
+                # show_log=False
             )
 
     return _plate_model, _vehicle_model, _ocr
